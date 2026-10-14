@@ -1,0 +1,77 @@
+# musicBOT の実行環境
+
+Python 3.14 の専用仮想環境 `.venv` に依存ライブラリを導入しています。
+mpv と Deno は `.tools` 内に配置し、音楽Botの起動時だけ PATH に追加します。
+
+## 起動
+
+- 接続確認用: `start_bot.cmd` をダブルクリック。
+- 音楽再生用: `start_music_bot.cmd` をダブルクリック。
+
+起動後、受付用テキストチャンネルのIDとBotトークンを入力します。
+トークンは非表示入力です。ファイルへの保存は不要です。
+通常はどちらか一方だけ起動してください。終了は Ctrl+C です。
+
+Discord Developer Portal の対象アプリ → Bot で **Message Content Intent** を有効にし、
+Botをサーバーへ追加して、受付チャンネルの「チャンネルを見る」「メッセージを送信」権限を付与してください。
+Discordの開発者モードを有効にすると、チャンネルの右クリックからIDをコピーできます。
+
+`bot.py` は `!ping` とYouTube URLへの返信のみを行います。
+`music_bot.py` はYouTube・ニコニコ動画のURLを受け付け、このPCのスピーカーで再生します。
+コマンド一覧は `/help` で確認できます。
+
+## PowerShell から起動
+
+```powershell
+cd C:\Users\user\all\kiruto\code\musicBOT
+.\start_bot.cmd
+# または
+.\start_music_bot.cmd
+```
+
+仮想環境の有効化やPowerShellの実行ポリシー変更は不要です。
+ソース先頭の `py -3.13` は今回の環境には該当しないため、上記起動ファイルを使用してください。
+
+## 依存ライブラリの再インストール
+
+```powershell
+py -3.14 -m venv .venv
+.\.venv\Scripts\python.exe -m pip install -r requirements.txt
+```
+
+mpv/Denoの取得元とチェックサムは `.tools/sources.json` に記録しています。
+配布元: https://mpv.io/installation/ 、https://github.com/denoland/deno/releases
+yt-dlp導入手順: https://github.com/yt-dlp/yt-dlp/wiki/Installation
+
+
+## コマンド
+
+音楽受付チャンネルで `/play url`、`/playlist url`、`/queue`、`/now`、
+`/skip`、`/pause`、`/resume`、`/clear`、`/stop`、`/ping`、`/help` を利用できます。
+従来の `!` コマンドとYouTube・ニコニコ動画URLの直接投稿も利用できます。
+ニコニコ動画は `nicovideo.jp/watch/sm...`（nm・so・数字のみのIDも可）、
+`nico.ms/sm...` の動画URL、マイリスト・シリーズURLに対応しています。
+`/playlist` ではYouTube再生リスト、ニコニコ動画のマイリスト・シリーズを先頭50件まで登録します。
+ログイン情報は使用しないため、会員限定など認証が必要な動画は取得できません。
+スキップ・一時停止・再開は曲を追加した本人またはサーバー管理者、停止と停止からの再開はサーバー管理者が操作できます。
+
+キューはチャンネル `1559531557348450395` の同じEmbedメッセージを編集して表示します。
+曲の追加・削除・準備・再生・終了・停止時に更新し、15秒ごとにも確認します。
+Embedの文字数上限に収まる範囲の再生予定順と、全待ち曲数・未表示件数を表示します。
+メッセージIDは `queue_message.json` に保存し、再起動時も同じメッセージを利用します。
+削除されたメッセージは自動で再作成します。予約そのものは再起動すると消えます。
+
+Botは `bot` と `applications.commands` のスコープで招待してください。
+受付とキュー表示チャンネルは同じサーバー内のテキストチャンネルを指定してください。
+両方で「チャンネルを見る」「メッセージを送信」「埋め込みリンク」、
+キュー表示先では「メッセージ履歴を読む」の権限が必要です。
+URL直接投稿・従来コマンドのため、Developer PortalのMessage Content Intentも有効にします。
+スラッシュコマンドは起動時に受付チャンネルのサーバーへ同期します。
+
+取得・再生・コマンド処理・キュー更新のエラーは音楽受付チャンネルに赤いEmbedで通知します。
+yt-dlp・mpvの終了コードと詳細出力も通知し、長い出力は末尾を表示します。
+BotトークンやURLのクエリ部分などは通知から除去します。
+キュー更新などの同じエラーは5分間重複通知を抑制します。
+Discordへの送信自体が権限・接続問題で失敗した場合はコンソールに記録します。
+
+検証: `python -m unittest -v test_music_bot.py`

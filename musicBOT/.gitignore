@@ -1,0 +1,8 @@
+.venv/
+.tools/
+__pycache__/
+*.pyc
+.env
+queue_message.json
+config.json
+bot_config.json

@@ -25,6 +25,8 @@ from discord import app_commands
 
 QUEUE_CHANNEL_ID = 1559531557348450395
 QUEUE_STATE = Path(__file__).with_name("queue_message.json")
+PREFETCH_COUNT = 3
+AUDIO_FILTER = "--af=lavfi=[loudnorm=I=-16:TP=-1.5:LRA=11]"
 
 VIDEO_ID = re.compile(r"^[A-Za-z0-9_-]{11}$")
 NICO_ID = re.compile(r"^(?:(?:sm|nm|so)\d+|\d+)$")
@@ -172,6 +174,8 @@ class MusicBot(discord.Client):
         self.ipc_path = None
         self.volume = 50
         self.volume_lock = asyncio.Lock()
+        self.downloads = {}
+        self.download_tasks = set()
         self.tree = app_commands.CommandTree(self)
         self.dashboard_lock = asyncio.Lock()
         self.dashboard_message = None
@@ -201,6 +205,10 @@ class MusicBot(discord.Client):
         if self.worker:
             self.worker.cancel()
             await asyncio.gather(self.worker, return_exceptions=True)
+        for task in list(self.downloads.values()):
+            self.discard_download(task)
+        self.downloads.clear()
+        await asyncio.gather(*self.download_tasks, return_exceptions=True)
         for process in list(self.processes):
             await self.kill(process)
         await super().close()
@@ -449,7 +457,7 @@ class MusicBot(discord.Client):
             room = 100 - len(self.queue.queues.get(author.id, []))
             tracks = []
             for entry in entries:
-                if not entry or entry.get("is_live") or entry.get("duration", 0) and entry["duration"] > 1800:
+                if not entry or entry.get("is_live") or entry.get("duration", 0) and entry["duration"] > 2700:
                     continue
                 video_url = track_url(entry, url)
                 if not video_url:
@@ -458,9 +466,10 @@ class MusicBot(discord.Client):
                                     video_url))
             accepted = tracks[:max(0, room)]
             if not accepted:
-                await reply("追加できる曲がありません。公開状態・30分以内か・予約上限を確認してください。")
+                await reply("追加できる曲がありません。公開状態・45分以内か・予約上限を確認してください。")
                 return
             self.queue.add(author.id, accepted)
+            self.refresh_prefetch()
             self.wake.set()
             await self.update_dashboard()
             await reply(f"{author.display_name}さんの曲を{len(accepted)}曲追加しました。" +
@@ -590,7 +599,53 @@ class MusicBot(discord.Client):
                 await reply("処理に失敗しました。詳細を音楽受付チャンネルに送信しました。")
 
         finally:
+            self.refresh_prefetch()
             await self.update_dashboard()
+
+    @staticmethod
+    def discard_download(task):
+        def cleanup(done):
+            if not done.cancelled() and done.exception() is None:
+                directory, _ = done.result()
+                directory.cleanup()
+        task.add_done_callback(cleanup)
+        if not task.done():
+            task.cancel()
+
+    async def download_track(self, track):
+        directory = tempfile.TemporaryDirectory(prefix="discord-music-")
+        root = Path(directory.name)
+        try:
+            await self.run_process(self.ytdlp() + [
+                "--no-playlist", "--no-progress", "--max-filesize", "100M",
+                "--match-filters", "!is_live & duration <= 2700",
+                "-f", "bestaudio/best", "-o", str(root / "audio.%(ext)s"), "--", track.url
+            ], timeout=300)
+            files = [p for p in root.glob("audio.*") if p.suffix in {
+                ".m4a", ".webm", ".mp4", ".mp3", ".opus", ".ogg", ".aac", ".flac", ".wav"
+            }]
+            if len(files) != 1:
+                raise RuntimeError("音声を取得できませんでした。ライブ配信・45分超・サイズ超過の曲は対象外です。")
+            return directory, files[0]
+        except BaseException:
+            directory.cleanup()
+            raise
+
+    def refresh_prefetch(self):
+        # 同じURLの別予約も個別に管理し、ユーザー交互の予測順に追従する。
+        tracks = ([self.current] if self.current else []) + self.queue.preview(PREFETCH_COUNT)
+        wanted = {id(track) for track in tracks}
+        for key in list(self.downloads):
+            if key not in wanted:
+                self.discard_download(self.downloads.pop(key))
+        for track in tracks:
+            if id(track) not in self.downloads:
+                task = asyncio.create_task(self.download_track(track))
+                self.downloads[id(track)] = task
+                self.download_tasks.add(task)
+                task.add_done_callback(self.download_tasks.discard)
+                # 先読み失敗は再生順が来たときに通知する。
+                task.add_done_callback(lambda done: None if done.cancelled() else done.exception())
 
     async def playback_loop(self):
         await self.wait_until_ready()
@@ -602,38 +657,42 @@ class MusicBot(discord.Client):
                 continue
             self.current = track
             self.skip_event = asyncio.Event()
+            self.refresh_prefetch()
             self.phase = "準備中"
+            skip_wait = None
             try:
                 await self.update_dashboard()
                 await self.say(f"準備中: {track.title[:150]}\n投稿者: {track.user_name}")
-                with tempfile.TemporaryDirectory(prefix="discord-music-") as directory:
-                    root = Path(directory)
-                    await self.run_process(self.ytdlp() + [
-                        "--no-playlist", "--no-progress", "--max-filesize", "100M",
-                        "--match-filters", "!is_live & duration <= 1800",
-                        "-f", "bestaudio/best", "-o", str(root / "audio.%(ext)s"), "--", track.url
-                    ], timeout=300, skip=self.skip_event)
-                    files = [p for p in root.glob("audio.*") if p.suffix in {
-                        ".m4a", ".webm", ".mp4", ".mp3", ".opus", ".ogg", ".aac", ".flac", ".wav"
-                    }]
-                    if len(files) != 1:
-                        raise RuntimeError("音声を取得できませんでした。ライブ配信・30分超・サイズ超過の曲は対象外です。")
-                    unique = "discord-music-" + uuid.uuid4().hex
-                    self.ipc_path = "\\\\.\\pipe\\" + unique if os.name == "nt" else str(root / "mpv.sock")
-                    if self.skip_event.is_set():
-                        raise Skipped()
-                    self.phase = "再生中"
-                    await self.update_dashboard()
-                    await self.say(f"再生開始: {track.title[:150]}\n投稿者: {track.user_name}")
-                    await self.run_process([
-                        self.mpv, "--no-config", "--vid=no", "--ytdl=no", f"--volume={self.volume}",
-                        "--input-terminal=no", "--input-ipc-server=" + self.ipc_path, "--", str(files[0])
-                    ], skip=self.skip_event)
+                download = self.downloads[id(track)]
+                skip_wait = asyncio.create_task(self.skip_event.wait())
+                await asyncio.wait({download, skip_wait}, return_when=asyncio.FIRST_COMPLETED)
+                if self.skip_event.is_set():
+                    raise Skipped()
+                directory, audio = download.result()
+                root = Path(directory.name)
+                unique = "discord-music-" + uuid.uuid4().hex
+                self.ipc_path = "\\\\.\\pipe\\" + unique if os.name == "nt" else str(root / "mpv.sock")
+                if self.skip_event.is_set():
+                    raise Skipped()
+                self.phase = "再生中"
+                await self.update_dashboard()
+                await self.say(f"再生開始: {track.title[:150]}\n投稿者: {track.user_name}")
+                await self.run_process([
+                    self.mpv, "--no-config", "--vid=no", "--ytdl=no", f"--volume={self.volume}",
+                    AUDIO_FILTER,
+                    "--input-terminal=no", "--input-ipc-server=" + self.ipc_path, "--", str(audio)
+                ], skip=self.skip_event)
             except Skipped:
                 pass
             except (RuntimeError, TimeoutError, OSError) as e:
                 await self.report_error(f"再生失敗: {track.title[:100]}\n次の予約へ進みます。", e)
             finally:
+                if skip_wait:
+                    skip_wait.cancel()
+                    await asyncio.gather(skip_wait, return_exceptions=True)
+                download = self.downloads.pop(id(track), None)
+                if download:
+                    self.discard_download(download)
                 self.current, self.skip_event, self.ipc_path = None, None, None
                 self.phase = "待機中"
                 await self.update_dashboard()

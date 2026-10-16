@@ -7,11 +7,13 @@
 import asyncio
 from collections import deque
 from dataclasses import dataclass
+from datetime import datetime, timedelta, timezone
 import getpass
 import json
 import os
 from pathlib import Path
 import re
+import random
 import shutil
 import socket
 import sys
@@ -27,6 +29,12 @@ QUEUE_CHANNEL_ID = 1559531557348450395
 QUEUE_STATE = Path(__file__).with_name("queue_message.json")
 PREFETCH_COUNT = 3
 AUDIO_FILTER = "--af=lavfi=[loudnorm=I=-16:TP=-1.5:LRA=11]"
+JST = timezone(timedelta(hours=9))
+
+
+def quiet_hours(now=None):
+    now = datetime.now(JST) if now is None else now.astimezone(JST)
+    return now.hour >= 22 or now.hour < 8
 
 VIDEO_ID = re.compile(r"^[A-Za-z0-9_-]{11}$")
 NICO_ID = re.compile(r"^(?:(?:sm|nm|so)\d+|\d+)$")
@@ -83,13 +91,34 @@ class FairQueue:
         self.turns = deque()
         self.last_user = None
 
-    def add(self, user_id, tracks):
+    def add(self, user_id, tracks, position=None):
         if not tracks:
             return
+        count = len(self.queues.get(user_id, []))
+        if position is not None and not 1 <= position <= count + 1:
+            raise ValueError(f"追加位置は1〜{count + 1}で指定してください。/myqueue で自分の順番を確認できます。")
         if user_id not in self.queues:
             self.queues[user_id] = deque()
             self.turns.append(user_id)
-        self.queues[user_id].extend(tracks)
+        items = list(self.queues[user_id])
+        index = len(items) if position is None else position - 1
+        items[index:index] = tracks
+        self.queues[user_id] = deque(items)
+
+    def move(self, user_id, source, destination):
+        items = list(self.queues.get(user_id, []))
+        if not (1 <= source <= len(items) and 1 <= destination <= len(items)):
+            raise ValueError("移動元・移動先は /myqueue に表示される自分の曲番号で指定してください。")
+        track = items.pop(source - 1)
+        items.insert(destination - 1, track)
+        self.queues[user_id] = deque(items)
+
+    def shuffle(self, user_id):
+        items = list(self.queues.get(user_id, []))
+        if len(items) < 2:
+            raise ValueError("シャッフルするには自分の待ち曲が2曲以上必要です。")
+        random.shuffle(items)
+        self.queues[user_id] = deque(items)
 
     def next(self):
         if not self.turns:
@@ -174,6 +203,7 @@ class MusicBot(discord.Client):
         self.ipc_path = None
         self.volume = 50
         self.volume_lock = asyncio.Lock()
+        self.user_paused = False
         self.downloads = {}
         self.download_tasks = set()
         self.tree = app_commands.CommandTree(self)
@@ -267,7 +297,7 @@ class MusicBot(discord.Client):
 
     def queue_embed(self):
         count = sum(len(q) for q in self.queue.queues.values())
-        state = "停止中" if self.stopped else self.phase
+        state = "停止中" if self.stopped else ("夜間休止中（日本時間8時に再開）" if quiet_hours() else self.phase)
         embed = discord.Embed(title="ミュージックキュー", colour=discord.Colour.blurple())
         embed.add_field(name="状態", value=state, inline=False)
         current = self.current
@@ -341,11 +371,23 @@ class MusicBot(discord.Client):
             "play": "YouTube・ニコニコ動画のURLから曲を追加", "playlist": "再生リスト・マイリスト・シリーズを追加"}
         descriptions.update({"volumeup": "音量を5ポイント上げる（最大100%）",
                              "volumedown": "音量を5ポイント下げる（最小0%）"})
+        descriptions.update({"myqueue": "自分の待ち曲と操作用の番号を表示",
+                             "move": "自分の待ち曲の順番を変更",
+                             "shuffle": "自分の待ち曲をシャッフル"})
         def callback_for(name):
             if name in ("play", "playlist"):
-                async def with_url(interaction: discord.Interaction, url: str):
-                    await self.slash_command(interaction, name, url)
+                @app_commands.describe(position="自分の待ち曲への追加位置（1が先頭、省略で末尾）")
+                async def with_url(interaction: discord.Interaction, url: str,
+                                   position: app_commands.Range[int, 1, 101] = None):
+                    await self.slash_command(interaction, name, url + (f" {position}" if position is not None else ""))
                 return with_url
+            if name == "move":
+                @app_commands.describe(source="移動する自分の曲番号", destination="移動後の曲番号")
+                async def with_positions(interaction: discord.Interaction,
+                                         source: app_commands.Range[int, 1, 100],
+                                         destination: app_commands.Range[int, 1, 100]):
+                    await self.slash_command(interaction, name, f"{source} {destination}")
+                return with_positions
             async def without_url(interaction: discord.Interaction):
                 await self.slash_command(interaction, name)
             return without_url
@@ -438,7 +480,7 @@ class MusicBot(discord.Client):
                 "--socket-timeout", "15", "--retries", "2", "--fragment-retries", "2",
                 "--js-runtimes", "deno:" + self.deno]
 
-    async def add_url(self, author, raw_url, force_playlist, reply=None):
+    async def add_url(self, author, raw_url, force_playlist, reply=None, position=None):
         reply = reply or self.say
         url, is_playlist = normalize_url(raw_url, force_playlist)
         generation = self.queue_generation
@@ -468,7 +510,7 @@ class MusicBot(discord.Client):
             if not accepted:
                 await reply("追加できる曲がありません。公開状態・45分以内か・予約上限を確認してください。")
                 return
-            self.queue.add(author.id, accepted)
+            self.queue.add(author.id, accepted, position)
             self.refresh_prefetch()
             self.wake.set()
             await self.update_dashboard()
@@ -492,6 +534,8 @@ class MusicBot(discord.Client):
             skip.set()
 
     async def send_ipc(self, command):
+        if command == ["set_property", "pause", False] and quiet_hours():
+            command = ["set_property", "pause", True]
         path = self.ipc_path
         if not path or self.phase not in ("再生中", "一時停止中"):
             raise ValueError("音声の準備中、または再生していません。")
@@ -529,18 +573,50 @@ class MusicBot(discord.Client):
             if command == "/ping":
                 await reply("接続OK！")
             elif command == "/help":
+                await reply("日本時間22時〜翌8時は夜間休止です。予約は受け付け、再生中の曲は8時に続きから再開します。")
+                await reply("/myqueue: 自分の待ち曲の番号を確認\n/move 3 1: 自分の3曲目を1曲目に移動\n"
+                            "/shuffle: 自分の待ち曲をシャッフル\n/play URL 2: 自分の2曲目に追加\n"
+                            "/playlist URL 2: リストを自分の2曲目から順に追加\n"
+                            "追加位置は省略すると末尾です。スラッシュコマンドでは position を指定できます。\n"
+                            "番号は再生中の曲を除く自分の待ち曲の順番です。")
                 await reply("/play URL: 1曲追加\n/playlist URL: リスト追加\n/queue: 順番\n/now: 現在の曲\n"
                                "/skip: 次へ\n/pause: 一時停止\n/resume: 再開\n/clear: 自分の待ち曲を削除\n"
                                "/reset: 全員の待ち曲をリセット（管理者のみ・再生中の曲は継続）\n"
                                "/volumeup: 音量を5ポイント上げる\n/volumedown: 音量を5ポイント下げる\n"
                                "音量は0～100%（初期値50%）。変更は次の曲にも引き継ぎます。\n"
                                "/stop: 停止（管理者のみ・予約は残す）\nスキップ/一時停止/再開/音量調整: 曲の本人か管理者。")
+            elif command == "/myqueue":
+                tracks = list(self.queue.queues.get(author.id, []))
+                if not tracks:
+                    await reply("自分の待ち曲はありません。")
+                for start in range(0, len(tracks), 15):
+                    listing = "\n".join(f"{i}. {t.title[:80]}" for i, t in enumerate(
+                        tracks[start:start + 15], start + 1))
+                    await reply(f"自分の待ち曲: {len(tracks)}曲（再生中を除く）\n" + listing)
+            elif command in ("/move", "/shuffle"):
+                try:
+                    if command == "/move":
+                        parts = text.split()
+                        if len(parts) != 3:
+                            raise ValueError("使い方: /move 移動元番号 移動先番号（例: /move 3 1）")
+                        source, destination = map(int, parts[1:])
+                        self.queue.move(author.id, source, destination)
+                    else:
+                        self.queue.shuffle(author.id)
+                except ValueError as error:
+                    await reply(str(error))
+                    return
+                await reply("自分の待ち曲の順番を変更しました。/myqueue で確認できます。")
             elif command == "/queue":
                 upcoming = self.queue.preview()
                 count = sum(len(q) for q in self.queue.queues.values())
                 listing = "\n".join(f"{i}. {t.title[:80]} — {t.user_name[:40]}" for i, t in enumerate(upcoming, 1))
                 await reply(f"待ち曲: {count}曲（先頭10曲・現在の予測順）\n" + (listing or "予約はありません。"))
             elif command == "/now":
+                if quiet_hours():
+                    await reply("夜間休止中です（日本時間22時〜翌8時）。" +
+                                (f"\n休止中の曲: {self.current.title[:150]}" if self.current else ""))
+                    return
                 await reply(f"{self.phase}: {self.current.title[:150]}\n投稿者: {self.current.user_name}"
                                if self.current else ("停止中です。" if self.stopped else "待機中です。"))
             elif command == "/clear":
@@ -585,12 +661,25 @@ class MusicBot(discord.Client):
                     await reply(f"音量を{volume}%に設定しました。")
                 else:
                     await self.send_ipc(["set_property", "pause", command == "/pause"])
+                    self.user_paused = command == "/pause"
                     self.phase = "一時停止中" if command == "/pause" else "再生中"
-                    await reply(self.phase + "です。")
+                    await reply("夜間休止中のため、再生は日本時間8時以降です。" if quiet_hours() else self.phase + "です。")
             else:
                 match = re.search(r"https?://[^\s<>]+", text)
                 if match:
-                    await self.add_url(author, match.group().rstrip("。"), command == "/playlist", reply)
+                    position = None
+                    if command in ("/play", "/playlist"):
+                        suffix = text[match.end():].strip()
+                        if suffix:
+                            if not suffix.isascii() or not suffix.isdigit() or int(suffix) < 1:
+                                await reply("追加位置は1以上の整数で指定してください。例: /play URL 2")
+                                return
+                            position = int(suffix)
+                        count = len(self.queue.queues.get(author.id, []))
+                        if position is not None and position > count + 1:
+                            await reply(f"追加位置は1〜{count + 1}で指定してください。")
+                            return
+                    await self.add_url(author, match.group().rstrip("。"), command == "/playlist", reply, position)
                 elif command == "/playlist":
                     await reply("/playlist の後に再生リストURLを付けてください。")
         except (ValueError, RuntimeError, TimeoutError, OSError, json.JSONDecodeError) as e:
@@ -647,15 +736,40 @@ class MusicBot(discord.Client):
                 # 先読み失敗は再生順が来たときに通知する。
                 task.add_done_callback(lambda done: None if done.cancelled() else done.exception())
 
+    async def play_audio(self, audio):
+        paused = quiet_hours() or self.user_paused
+        playback = asyncio.create_task(self.run_process([
+            self.mpv, "--no-config", "--vid=no", "--ytdl=no", f"--volume={self.volume}",
+            "--pause=" + ("yes" if paused else "no"), AUDIO_FILTER,
+            "--input-terminal=no", "--input-ipc-server=" + self.ipc_path, "--", str(audio)
+        ], skip=self.skip_event))
+        try:
+            while not playback.done():
+                desired = quiet_hours() or self.user_paused
+                if desired != paused:
+                    await self.send_ipc(["set_property", "pause", desired])
+                    paused = desired
+                    await self.update_dashboard()
+                await asyncio.wait({playback}, timeout=0.25)
+            await playback
+        finally:
+            if not playback.done():
+                playback.cancel()
+            await asyncio.gather(playback, return_exceptions=True)
+
     async def playback_loop(self):
         await self.wait_until_ready()
         while True:
             self.wake.clear()
+            if quiet_hours():
+                await asyncio.sleep(0.25)
+                continue
             track = None if self.stopped else self.queue.next()
             if track is None:
                 await self.wake.wait()
                 continue
             self.current = track
+            self.user_paused = False
             self.skip_event = asyncio.Event()
             self.refresh_prefetch()
             self.phase = "準備中"
@@ -677,11 +791,7 @@ class MusicBot(discord.Client):
                 self.phase = "再生中"
                 await self.update_dashboard()
                 await self.say(f"再生開始: {track.title[:150]}\n投稿者: {track.user_name}")
-                await self.run_process([
-                    self.mpv, "--no-config", "--vid=no", "--ytdl=no", f"--volume={self.volume}",
-                    AUDIO_FILTER,
-                    "--input-terminal=no", "--input-ipc-server=" + self.ipc_path, "--", str(audio)
-                ], skip=self.skip_event)
+                await self.play_audio(audio)
             except Skipped:
                 pass
             except (RuntimeError, TimeoutError, OSError) as e:

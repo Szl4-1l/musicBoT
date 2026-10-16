@@ -520,7 +520,7 @@ class MusicBot(discord.Client):
             return
         text = message.content.strip()
         if text.startswith("!"):
-            return
+            text = "/" + text[1:]
         await self.handle_command(message.author, text, self.say)
 
     async def handle_command(self, author, text, reply):

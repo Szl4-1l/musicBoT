@@ -2,13 +2,16 @@ import asyncio
 from pathlib import Path
 import tempfile
 import unittest
-from unittest.mock import AsyncMock, Mock
+from unittest.mock import AsyncMock, Mock, patch
 
 from music_bot_2_GPT6 import MusicBot, Track
 
 
 class PrefetchTests(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
+        quiet = patch("music_bot_2_GPT6.quiet_hours", return_value=False)
+        quiet.start()
+        self.addCleanup(quiet.stop)
         self.bot = MusicBot(1, "mpv", "deno")
         self.bot.run_process = AsyncMock()
 

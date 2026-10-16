@@ -7,6 +7,7 @@
 import asyncio
 from collections import deque
 from dataclasses import dataclass
+from datetime import datetime, timedelta, timezone
 import getpass
 import json
 import os
@@ -28,6 +29,12 @@ QUEUE_CHANNEL_ID = 1559531557348450395
 QUEUE_STATE = Path(__file__).with_name("queue_message.json")
 PREFETCH_COUNT = 3
 AUDIO_FILTER = "--af=lavfi=[loudnorm=I=-16:TP=-1.5:LRA=11]"
+JST = timezone(timedelta(hours=9))
+
+
+def quiet_hours(now=None):
+    now = datetime.now(JST) if now is None else now.astimezone(JST)
+    return now.hour >= 22 or now.hour < 8
 
 VIDEO_ID = re.compile(r"^[A-Za-z0-9_-]{11}$")
 NICO_ID = re.compile(r"^(?:(?:sm|nm|so)\d+|\d+)$")
@@ -196,6 +203,7 @@ class MusicBot(discord.Client):
         self.ipc_path = None
         self.volume = 50
         self.volume_lock = asyncio.Lock()
+        self.user_paused = False
         self.downloads = {}
         self.download_tasks = set()
         self.tree = app_commands.CommandTree(self)
@@ -289,7 +297,7 @@ class MusicBot(discord.Client):
 
     def queue_embed(self):
         count = sum(len(q) for q in self.queue.queues.values())
-        state = "停止中" if self.stopped else self.phase
+        state = "停止中" if self.stopped else ("夜間休止中（日本時間8時に再開）" if quiet_hours() else self.phase)
         embed = discord.Embed(title="ミュージックキュー", colour=discord.Colour.blurple())
         embed.add_field(name="状態", value=state, inline=False)
         current = self.current
@@ -526,6 +534,8 @@ class MusicBot(discord.Client):
             skip.set()
 
     async def send_ipc(self, command):
+        if command == ["set_property", "pause", False] and quiet_hours():
+            command = ["set_property", "pause", True]
         path = self.ipc_path
         if not path or self.phase not in ("再生中", "一時停止中"):
             raise ValueError("音声の準備中、または再生していません。")
@@ -563,6 +573,7 @@ class MusicBot(discord.Client):
             if command == "/ping":
                 await reply("接続OK！")
             elif command == "/help":
+                await reply("日本時間22時〜翌8時は夜間休止です。予約は受け付け、再生中の曲は8時に続きから再開します。")
                 await reply("/myqueue: 自分の待ち曲の番号を確認\n/move 3 1: 自分の3曲目を1曲目に移動\n"
                             "/shuffle: 自分の待ち曲をシャッフル\n/play URL 2: 自分の2曲目に追加\n"
                             "/playlist URL 2: リストを自分の2曲目から順に追加\n"
@@ -602,6 +613,10 @@ class MusicBot(discord.Client):
                 listing = "\n".join(f"{i}. {t.title[:80]} — {t.user_name[:40]}" for i, t in enumerate(upcoming, 1))
                 await reply(f"待ち曲: {count}曲（先頭10曲・現在の予測順）\n" + (listing or "予約はありません。"))
             elif command == "/now":
+                if quiet_hours():
+                    await reply("夜間休止中です（日本時間22時〜翌8時）。" +
+                                (f"\n休止中の曲: {self.current.title[:150]}" if self.current else ""))
+                    return
                 await reply(f"{self.phase}: {self.current.title[:150]}\n投稿者: {self.current.user_name}"
                                if self.current else ("停止中です。" if self.stopped else "待機中です。"))
             elif command == "/clear":
@@ -646,8 +661,9 @@ class MusicBot(discord.Client):
                     await reply(f"音量を{volume}%に設定しました。")
                 else:
                     await self.send_ipc(["set_property", "pause", command == "/pause"])
+                    self.user_paused = command == "/pause"
                     self.phase = "一時停止中" if command == "/pause" else "再生中"
-                    await reply(self.phase + "です。")
+                    await reply("夜間休止中のため、再生は日本時間8時以降です。" if quiet_hours() else self.phase + "です。")
             else:
                 match = re.search(r"https?://[^\s<>]+", text)
                 if match:
@@ -720,15 +736,40 @@ class MusicBot(discord.Client):
                 # 先読み失敗は再生順が来たときに通知する。
                 task.add_done_callback(lambda done: None if done.cancelled() else done.exception())
 
+    async def play_audio(self, audio):
+        paused = quiet_hours() or self.user_paused
+        playback = asyncio.create_task(self.run_process([
+            self.mpv, "--no-config", "--vid=no", "--ytdl=no", f"--volume={self.volume}",
+            "--pause=" + ("yes" if paused else "no"), AUDIO_FILTER,
+            "--input-terminal=no", "--input-ipc-server=" + self.ipc_path, "--", str(audio)
+        ], skip=self.skip_event))
+        try:
+            while not playback.done():
+                desired = quiet_hours() or self.user_paused
+                if desired != paused:
+                    await self.send_ipc(["set_property", "pause", desired])
+                    paused = desired
+                    await self.update_dashboard()
+                await asyncio.wait({playback}, timeout=0.25)
+            await playback
+        finally:
+            if not playback.done():
+                playback.cancel()
+            await asyncio.gather(playback, return_exceptions=True)
+
     async def playback_loop(self):
         await self.wait_until_ready()
         while True:
             self.wake.clear()
+            if quiet_hours():
+                await asyncio.sleep(0.25)
+                continue
             track = None if self.stopped else self.queue.next()
             if track is None:
                 await self.wake.wait()
                 continue
             self.current = track
+            self.user_paused = False
             self.skip_event = asyncio.Event()
             self.refresh_prefetch()
             self.phase = "準備中"
@@ -750,11 +791,7 @@ class MusicBot(discord.Client):
                 self.phase = "再生中"
                 await self.update_dashboard()
                 await self.say(f"再生開始: {track.title[:150]}\n投稿者: {track.user_name}")
-                await self.run_process([
-                    self.mpv, "--no-config", "--vid=no", "--ytdl=no", f"--volume={self.volume}",
-                    AUDIO_FILTER,
-                    "--input-terminal=no", "--input-ipc-server=" + self.ipc_path, "--", str(audio)
-                ], skip=self.skip_event)
+                await self.play_audio(audio)
             except Skipped:
                 pass
             except (RuntimeError, TimeoutError, OSError) as e:

@@ -53,6 +53,19 @@ yt-dlp導入手順: https://github.com/yt-dlp/yt-dlp/wiki/Installation
 
 ## コマンド
 
+`music_bot_2_GPT6.py` では自分のアカウントの待ち曲を編集できます。
+再生中の曲は番号に含めず、アカウント同士の交互再生は維持します。
+
+- `/myqueue`: 自分の待ち曲と番号を全件表示。
+- `/move 3 1`: 自分の3曲目を先頭に移動（スラッシュ入力では `source` と `destination`）。
+- `/shuffle`: 自分の待ち曲をランダムに並べ替え。
+- `/play URL 2`: 自分の2曲目の位置に追加（スラッシュ入力では `position: 2`）。
+- `/playlist URL 2`: 自分の2曲目からリストの曲順でまとめて挿入。
+
+追加位置は1〜待ち曲数+1で指定でき、省略すると末尾へ追加します。
+動画情報の取得中に待ち曲数が変わり、指定位置が範囲外になった場合は追加せずエラーを通知します。
+`bot _GPT6.py` は接続確認用です。曲の管理には再生用の `music_bot_2_GPT6.py` を起動してください。
+
 音楽受付チャンネルで `/play url`、`/playlist url`、`/queue`、`/now`、
 `/skip`、`/pause`、`/resume`、`/clear`、`/stop`、`/ping`、`/help` を利用できます。
 従来の `!` コマンドとYouTube・ニコニコ動画URLの直接投稿も利用できます。

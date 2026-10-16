@@ -85,6 +85,7 @@ def main():
         print(f"接続成功: {client.user}")
         print("指定チャンネルに !ping またはYouTubeのURLを送ってください。")
         print("終了するには、この画面で Ctrl+C を押します。")
+        print("曲の並べ替え・シャッフル・指定位置への追加は music_bot_2_GPT6.py を起動し、/help で確認してください。")
 
     @client.event
     async def on_message(message):
